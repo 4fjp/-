@@ -27,13 +27,10 @@ end
 -- ============================================================
 -- Noclip
 -- ============================================================
-local noclipEnabled    = false
 local noclipConnection = nil
 
 local function SetNoclip(state)
-    noclipEnabled = state
     if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
-
     if state then
         noclipConnection = RunService.Stepped:Connect(function()
             local char = LocalPlayer.Character
@@ -51,105 +48,66 @@ local function SetNoclip(state)
 end
 
 -- ============================================================
--- カメラ視点切替（毎フレーム強制適用）
+-- 三人称化（Classic カメラを強制）
 -- ============================================================
-local viewIsFirstPerson      = false
-local viewEnforceConnection  = nil
+local thirdPersonConnection = nil
 
-local function EnforceView()
-    if viewIsFirstPerson then
-        if LocalPlayer.CameraMode ~= Enum.CameraMode.LockFirstPerson then
-            LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
-        end
-        if LocalPlayer.CameraMinZoomDistance ~= 0.5 then
-            LocalPlayer.CameraMinZoomDistance = 0.5
-        end
-        if LocalPlayer.CameraMaxZoomDistance ~= 0.5 then
-            LocalPlayer.CameraMaxZoomDistance = 0.5
-        end
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum and hum.CameraOffset ~= Vector3.new(0, 0.5, 0) then
-                hum.CameraOffset = Vector3.new(0, 0.5, 0)
-            end
-        end
-    else
-        if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
-            LocalPlayer.CameraMode = Enum.CameraMode.Classic
-        end
-        if LocalPlayer.CameraMinZoomDistance ~= 0.5 then
-            LocalPlayer.CameraMinZoomDistance = 0.5
-        end
-        if LocalPlayer.CameraMaxZoomDistance ~= 128 then
-            LocalPlayer.CameraMaxZoomDistance = 128
-        end
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum and hum.CameraOffset ~= Vector3.new(0, 0, 0) then
-                hum.CameraOffset = Vector3.new(0, 0, 0)
-            end
+local function EnforceThirdPerson()
+    if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
+        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+    end
+    if LocalPlayer.CameraMaxZoomDistance < 12 then
+        LocalPlayer.CameraMaxZoomDistance = 12
+    end
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.CameraOffset ~= Vector3.new(0, 0, 0) then
+            hum.CameraOffset = Vector3.new(0, 0, 0)
         end
     end
 end
 
-local function ApplyView(firstPerson)
-    viewIsFirstPerson = firstPerson
-    EnforceView()
-
-    if viewEnforceConnection then viewEnforceConnection:Disconnect() end
-    viewEnforceConnection = RunService.RenderStepped:Connect(EnforceView)
-
-    Notify("View", firstPerson and "一人称視点" or "三人称視点", 2)
+local function SetThirdPerson(state)
+    if thirdPersonConnection then thirdPersonConnection:Disconnect() thirdPersonConnection = nil end
+    if state then
+        thirdPersonConnection = RunService.RenderStepped:Connect(EnforceThirdPerson)
+        Notify("View", "三人称化 有効", 2)
+    else
+        Notify("View", "三人称化 無効", 2)
+    end
 end
 
 LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.5)
-    EnforceView()
+    if thirdPersonConnection then
+        EnforceThirdPerson()
+    end
 end)
 
 -- ============================================================
--- Toy 複数人同時固定
+-- Toy 個別固定管理
 -- ============================================================
-local activeToys       = {}   -- [Player] = { toy = Instance, conn = RBXScriptConnection }
-local multiFixRunning  = false
+local activeToys = {}   -- [Player] = { toy = Instance, conn = RBXScriptConnection }
 
-local function StartLockForPlayer(plr, toy)
-    local conn = RunService.Heartbeat:Connect(function()
-        if not toy or not toy.Parent then
-            if activeToys[plr] then
-                if activeToys[plr].conn then activeToys[plr].conn:Disconnect() end
-                activeToys[plr] = nil
-            end
-            return
-        end
-        local char = plr.Character
-        if not char then return end
-        local r = char:FindFirstChild("HumanoidRootPart")
-        if not r then return end
+local function StopFixFor(plr)
+    local data = activeToys[plr]
+    if not data then return end
+    if data.conn then data.conn:Disconnect() end
+    if data.toy then
         pcall(function()
-            if toy:IsA("BasePart") then
-                toy.CFrame = r.CFrame
-            elseif toy:IsA("Model") then
-                if not toy.PrimaryPart then
-                    for _, p in ipairs(toy:GetDescendants()) do
-                        if p:IsA("BasePart") then toy.PrimaryPart = p break end
-                    end
-                end
-                if toy.PrimaryPart then toy:PivotTo(r.CFrame) end
-            end
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(data.toy)
         end)
-    end)
-    activeToys[plr] = { toy = toy, conn = conn }
+    end
+    activeToys[plr] = nil
 end
 
-local function SpawnToyForPlayer(plr)
+local function StartFixFor(plr)
+    if activeToys[plr] then return end
     if not plr.Character then return end
     local root = plr.Character:FindFirstChild("HumanoidRootPart")
     if not root then return end
 
-    -- 生成前に既存Toyを記録
     local existing = {}
     local folder0 = workspace:FindFirstChild("i1aljSpawnedInToys")
     if folder0 then
@@ -171,50 +129,53 @@ local function SpawnToyForPlayer(plr)
 
     local newToy
     for _, v in ipairs(folder:GetChildren()) do
-        if not existing[v] then
-            newToy = v
-            break
-        end
+        if not existing[v] then newToy = v break end
     end
+    if not newToy then return end
 
-    if newToy then
-        StartLockForPlayer(plr, newToy)
-    end
-end
-
-local function StartMultiFix()
-    if multiFixRunning then return end
-    multiFixRunning = true
-
-    task.spawn(function()
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and plr.Character then
-                SpawnToyForPlayer(plr)
-                task.wait(0.2)
+    local conn = RunService.Heartbeat:Connect(function()
+        if not newToy or not newToy.Parent then
+            if activeToys[plr] and activeToys[plr].conn then
+                activeToys[plr].conn:Disconnect()
             end
+            activeToys[plr] = nil
+            return
         end
-        Notify("Toy", "サーバー内全員にToyを固定しました", 3)
-        multiFixRunning = false
+        local char = plr.Character
+        if not char then return end
+        local r = char:FindFirstChild("HumanoidRootPart")
+        if not r then return end
+        pcall(function()
+            if newToy:IsA("BasePart") then
+                newToy.CFrame = r.CFrame
+            elseif newToy:IsA("Model") then
+                if not newToy.PrimaryPart then
+                    for _, p in ipairs(newToy:GetDescendants()) do
+                        if p:IsA("BasePart") then newToy.PrimaryPart = p break end
+                    end
+                end
+                if newToy.PrimaryPart then newToy:PivotTo(r.CFrame) end
+            end
+        end)
     end)
+
+    activeToys[plr] = { toy = newToy, conn = conn }
 end
 
-local function StopMultiFix()
-    multiFixRunning = false
-    for plr, data in pairs(activeToys) do
-        if data.conn then data.conn:Disconnect() end
-        if data.toy then
-            pcall(function()
-                ReplicatedStorage.MenuToys.DestroyToy:FireServer(data.toy)
-            end)
-        end
+local function StopAllFixes()
+    for plr, _ in pairs(activeToys) do
+        StopFixFor(plr)
     end
-    activeToys = {}
-    Notify("Toy", "固定を停止しました", 2)
+    Notify("Toy", "すべての固定を停止しました", 2)
 end
 
 -- ============================================================
--- UI 設定（Orion の ScreenGui に UIScale を適用）
+-- UI 非等方スケーリング（横幅・高さを個別倍率）
 -- ============================================================
+local uiOriginalSizes = setmetatable({}, { __mode = "k" })
+local uiMulX, uiMulY   = 1, 1
+local uiLoopRunning    = false
+
 local function GetOrionScreenGui()
     local parents = {}
     if gethui then pcall(function() table.insert(parents, gethui()) end) end
@@ -233,31 +194,50 @@ local function GetOrionScreenGui()
     return nil
 end
 
-local uiScaleValue = 1
-
-local function ApplyUIScale(value)
-    uiScaleValue = value
+local function ApplyUIScale()
     local gui = GetOrionScreenGui()
     if not gui then return end
-    local scale = gui:FindFirstChild("__UIScale")
-    if not scale then
-        scale = Instance.new("UIScale")
-        scale.Name = "__UIScale"
-        scale.Parent = gui
+
+    for _, obj in ipairs(gui:GetDescendants()) do
+        if obj:IsA("GuiObject") then
+            if not uiOriginalSizes[obj] then
+                uiOriginalSizes[obj] = obj.Size
+            end
+            local orig = uiOriginalSizes[obj]
+            local newSize = UDim2.new(
+                orig.X.Scale  * uiMulX, orig.X.Offset * uiMulX,
+                orig.Y.Scale  * uiMulY, orig.Y.Offset * uiMulY
+            )
+            if obj.Size ~= newSize then
+                obj.Size = newSize
+            end
+        end
     end
-    scale.Scale = value
+end
+
+local function StartUILoop()
+    if uiLoopRunning then return end
+    uiLoopRunning = true
+    task.spawn(function()
+        while uiLoopRunning do
+            if uiMulX ~= 1 or uiMulY ~= 1 then
+                ApplyUIScale()
+            end
+            task.wait(0.3)
+        end
+    end)
 end
 
 -- ============================================================
 -- Orion GUI 構築
 -- ============================================================
 local Window = OrionLib:MakeWindow({
-    Name          = "Toy Controller",
-    HidePremium   = false,
-    SaveConfig    = false,
-    IntroEnabled  = true,
-    IntroText     = "Toy Controller",
-    ConfigFolder  = "ToyController"
+    Name         = "Toy Controller",
+    HidePremium  = false,
+    SaveConfig   = false,
+    IntroEnabled = true,
+    IntroText    = "Toy Controller",
+    ConfigFolder = "ToyController"
 })
 
 -- ---------- メイン ----------
@@ -267,25 +247,75 @@ local MainTab = Window:MakeTab({
     PremiumOnly = false
 })
 
-MainTab:AddButton({
-    Name = "サーバー全員にToyを固定",
-    Callback = function()
-        StartMultiFix()
+local function GetSelectablePlayerNames()
+    local names = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            table.insert(names, plr.Name)
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function FindPlayerByName(name)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Name == name then return plr end
+    end
+    return nil
+end
+
+local PlayerDropdown
+PlayerDropdown = MainTab:AddDropdown({
+    Name    = "Toy固定するプレイヤー（複数選択）",
+    Options = GetSelectablePlayerNames(),
+    Default = {},
+    Multi   = true,
+    Callback = function(selected)
+        for plr, _ in pairs(activeToys) do
+            if not (selected and selected[plr.Name]) then
+                StopFixFor(plr)
+            end
+        end
+        if selected then
+            for name, isOn in pairs(selected) do
+                if isOn then
+                    local plr = FindPlayerByName(name)
+                    if plr and not activeToys[plr] then
+                        task.spawn(function() StartFixFor(plr) end)
+                    end
+                end
+            end
+        end
     end
 })
 
 MainTab:AddButton({
-    Name = "Toy固定を停止",
+    Name = "プレイヤーリストを更新",
     Callback = function()
-        StopMultiFix()
+        local names = GetSelectablePlayerNames()
+        if PlayerDropdown and PlayerDropdown.Refresh then
+            PlayerDropdown:Refresh(names, true)
+        end
+        Notify("Toy", "プレイヤーリストを更新しました", 2)
+    end
+})
+
+MainTab:AddButton({
+    Name = "すべてのToy固定を停止",
+    Callback = function()
+        StopAllFixes()
+        if PlayerDropdown and PlayerDropdown.Refresh then
+            PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
+        end
     end
 })
 
 MainTab:AddToggle({
-    Name     = "一人称視点",
+    Name     = "三人称化",
     Default  = false,
     Callback = function(value)
-        ApplyView(value)
+        SetThirdPerson(value)
     end
 })
 
@@ -305,7 +335,7 @@ local SettingsTab = Window:MakeTab({
 })
 
 SettingsTab:AddSlider({
-    Name      = "UIスケール（縦横比）",
+    Name      = "UI 横幅倍率",
     Min       = 0.5,
     Max       = 2,
     Default   = 1,
@@ -313,21 +343,54 @@ SettingsTab:AddSlider({
     Increment = 0.05,
     ValueName = "x",
     Callback  = function(value)
-        ApplyUIScale(value)
+        uiMulX = value
+        ApplyUIScale()
+    end
+})
+
+SettingsTab:AddSlider({
+    Name      = "UI 高さ倍率",
+    Min       = 0.5,
+    Max       = 2,
+    Default   = 1,
+    Color     = Color3.fromRGB(255, 130, 130),
+    Increment = 0.05,
+    ValueName = "x",
+    Callback  = function(value)
+        uiMulY = value
+        ApplyUIScale()
     end
 })
 
 SettingsTab:AddButton({
-    Name = "UIスケールをリセット",
+    Name = "UIサイズをリセット",
     Callback = function()
-        ApplyUIScale(1)
-        Notify("UI", "UIスケールを1.0xに戻しました", 2)
+        uiMulX, uiMulY = 1, 1
+        ApplyUIScale()
+        Notify("UI", "UIサイズをリセットしました", 2)
     end
 })
 
 OrionLib:Init()
+StartUILoop()
 
--- Init 後に Orion ScreenGui が生成されるため遅延で再適用
+-- Init 後に ScreenGui 生成を待って適用
 task.delay(1, function()
-    ApplyUIScale(uiScaleValue)
+    ApplyUIScale()
+end)
+
+-- プレイヤー出入りの自動検知
+Players.PlayerAdded:Connect(function()
+    task.wait(0.5)
+    if PlayerDropdown and PlayerDropdown.Refresh then
+        PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+    StopFixFor(plr)
+    task.wait(0.2)
+    if PlayerDropdown and PlayerDropdown.Refresh then
+        PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
+    end
 end)
