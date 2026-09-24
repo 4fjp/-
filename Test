@@ -1,396 +1,458 @@
 -- ============================================================
--- Toy Controller (Mobile / Orionlib - Qanuir/orion-ui)
+-- FPS Script (ESP / Aimbot / Noclip)
+-- UI: Orion Library (Qanuir/orion-ui)
+-- モバイル向け / エグゼキューター用
 -- ============================================================
 
+-- 通知関数（print禁止のためStarterGuiを使用）
+local StarterGui = game:GetService("StarterGui")
+
+local function Notify(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 3
+        })
+    end)
+end
+
+-- ============================================================
+-- Orion Library 読み込み
+-- ============================================================
 local OrionLib = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/Qanuir/orion-ui/refs/heads/main/source.lua"
 ))()
 
+-- ============================================================
+-- サービス取得
+-- ============================================================
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local StarterGui        = game:GetService("StarterGui")
-
-local LocalPlayer = Players.LocalPlayer
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local Camera            = Workspace.CurrentCamera
+local LocalPlayer       = Players.LocalPlayer
+local Mouse             = LocalPlayer:GetMouse()
 
 -- ============================================================
--- Notify
+-- 状態管理テーブル
 -- ============================================================
-local function Notify(title, text, duration)
-    StarterGui:SetCore("SendNotification", {
-        Title    = title,
-        Text     = text,
-        Duration = duration
-    })
+local State = {
+    ESP        = false,
+    Aimbot     = false,
+    Noclip     = false,
+    ESPColor   = Color3.fromRGB(255, 0, 0),
+    FOV        = 150,
+    AimbotKey  = Enum.KeyCode.ButtonR2,   -- モバイル: R2ボタン
+    TeamCheck  = true,
+    WallCheck  = false,
+}
+
+-- ESP描画オブジェクト管理
+local ESPObjects = {}
+
+-- ============================================================
+-- ユーティリティ
+-- ============================================================
+
+-- チームカラー取得
+local function getTeamColor(player)
+    if player.Team then
+        return player.Team.TeamColor.Color
+    end
+    return State.ESPColor
 end
+
+-- 対象が有効か判定
+local function isValidTarget(plr)
+    if plr == LocalPlayer then return false end
+    if not plr.Character then return false end
+    if not plr.Character:FindFirstChild("Humanoid") then return false end
+    if plr.Character.Humanoid.Health <= 0 then return false end
+    if State.TeamCheck and plr.Team == LocalPlayer.Team then return false end
+    return true
+end
+
+-- ============================================================
+-- ESP / Wallhack
+-- ============================================================
+local function createESP(plr)
+    if not isValidTarget(plr) then return end
+    if ESPObjects[plr] then return end
+
+    local box = Drawing.new("Square")
+    box.Thickness = 2
+    box.Filled = false
+    box.Transparency = 1
+    box.Color = getTeamColor(plr)
+    box.Visible = false
+
+    local nameTag = Drawing.new("Text")
+    nameTag.Size = 14
+    nameTag.Center = true
+    nameTag.Outline = true
+    nameTag.Color = Color3.fromRGB(255, 255, 255)
+    nameTag.Visible = false
+
+    local healthBar = Drawing.new("Square")
+    healthBar.Thickness = 1
+    healthBar.Filled = true
+    healthBar.Color = Color3.fromRGB(0, 255, 0)
+    healthBar.Visible = false
+
+    ESPObjects[plr] = {
+        Box = box,
+        Name = nameTag,
+        Health = healthBar,
+    }
+end
+
+local function removeESP(plr)
+    local obj = ESPObjects[plr]
+    if not obj then return end
+    for _, v in pairs(obj) do
+        pcall(function() v:Remove() end)
+    end
+    ESPObjects[plr] = nil
+end
+
+local function updateESP()
+    for plr, obj in pairs(ESPObjects) do
+        if not isValidTarget(plr) then
+            obj.Box.Visible = false
+            obj.Name.Visible = false
+            obj.Health.Visible = false
+            continue
+        end
+
+        local char = plr.Character
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then
+            obj.Box.Visible = false
+            obj.Name.Visible = false
+            obj.Health.Visible = false
+            continue
+        end
+
+        -- 画面座標変換
+        local pos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+        if not onScreen then
+            obj.Box.Visible = false
+            obj.Name.Visible = false
+            obj.Health.Visible = false
+            continue
+        end
+
+        -- サイズ計算（距離に応じてスケール）
+        local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
+        local height = 1000 / dist
+        local width  = height * 0.6
+
+        obj.Box.Size = Vector2.new(width, height)
+        obj.Box.Position = Vector2.new(pos.X - width / 2, pos.Y - height / 2)
+        obj.Box.Color = getTeamColor(plr)
+        obj.Box.Visible = true
+
+        obj.Name.Text = plr.Name
+        obj.Name.Position = Vector2.new(pos.X, pos.Y - height / 2 - 16)
+        obj.Name.Visible = true
+
+        -- ヘルスバー
+        local hpRatio = hum.Health / hum.MaxHealth
+        obj.Health.Size = Vector2.new(3, height * hpRatio)
+        obj.Health.Position = Vector2.new(
+            pos.X - width / 2 - 6,
+            pos.Y + height / 2 - height * hpRatio
+        )
+        obj.Health.Color = Color3.fromRGB(255 * (1 - hpRatio), 255 * hpRatio, 0)
+        obj.Health.Visible = true
+    end
+end
+
+-- ============================================================
+-- Aimbot / Autoaim
+-- ============================================================
+
+-- 画面中心から最も近いターゲットを取得
+local function getClosestTarget()
+    local closest = nil
+    local shortestDist = State.FOV
+
+    for _, plr in pairs(Players:GetPlayers()) do
+        if not isValidTarget(plr) then continue end
+
+        local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then continue end
+
+        local screenPos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+        if not onScreen then continue end
+
+        -- 画面中心からの距離
+        local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+
+        if dist < shortestDist then
+            shortestDist = dist
+            closest = plr
+        end
+    end
+
+    return closest
+end
+
+-- カメラをターゲットへ向ける
+local function aimAt(target)
+    local hrp = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- 壁チェック
+    if State.WallCheck then
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.FilterDescendantsInstances = { LocalPlayer.Character }
+        local result = Workspace:Raycast(
+            Camera.CFrame.Position,
+            hrp.Position - Camera.CFrame.Position,
+            rayParams
+        )
+        if result and result.Instance then
+            local hitModel = result.Instance:FindFirstAncestorOfClass("Model")
+            if hitModel ~= target.Character then
+                return -- 壁の向こう
+            end
+        end
+    end
+
+    -- カメラをスムーズにターゲットへ
+    Camera.CFrame = CFrame.new(
+        Camera.CFrame.Position,
+        hrp.Position
+    )
+end
+
+-- モバイル入力ハンドラ
+local aiming = false
+
+-- ボタン押下開始
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == State.AimbotKey and State.Aimbot then
+        aiming = true
+    end
+end)
+
+-- ボタン離し
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+    if input.KeyCode == State.AimbotKey then
+        aiming = false
+    end
+end)
 
 -- ============================================================
 -- Noclip
 -- ============================================================
-local noclipConnection = nil
+local noclipConn
 
-local function SetNoclip(state)
-    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
-    if state then
-        noclipConnection = RunService.Stepped:Connect(function()
-            local char = LocalPlayer.Character
-            if not char then return end
-            for _, part in ipairs(char:GetDescendants()) do
-                if part:IsA("BasePart") and part.CanCollide then
-                    part.CanCollide = false
-                end
+local function enableNoclip()
+    noclipConn = RunService.Stepped:Connect(function()
+        if not State.Noclip then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
             end
-        end)
-        Notify("Noclip", "有効", 2)
-    else
-        Notify("Noclip", "無効", 2)
-    end
+        end
+    end)
 end
 
--- ============================================================
--- 三人称化（Classic カメラを強制）
--- ============================================================
-local thirdPersonConnection = nil
-
-local function EnforceThirdPerson()
-    if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
-        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+local function disableNoclip()
+    if noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
     end
-    if LocalPlayer.CameraMaxZoomDistance < 12 then
-        LocalPlayer.CameraMaxZoomDistance = 12
-    end
+    -- 元に戻す
     local char = LocalPlayer.Character
     if char then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum and hum.CameraOffset ~= Vector3.new(0, 0, 0) then
-            hum.CameraOffset = Vector3.new(0, 0, 0)
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = true
+            end
         end
     end
 end
 
-local function SetThirdPerson(state)
-    if thirdPersonConnection then thirdPersonConnection:Disconnect() thirdPersonConnection = nil end
-    if state then
-        thirdPersonConnection = RunService.RenderStepped:Connect(EnforceThirdPerson)
-        Notify("View", "三人称化 有効", 2)
-    else
-        Notify("View", "三人称化 無効", 2)
+-- ============================================================
+-- メインループ（ESP更新 + Aimbot）
+-- ============================================================
+RunService.RenderStepped:Connect(function()
+    -- ESP更新
+    if State.ESP then
+        updateESP()
     end
-end
 
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    if thirdPersonConnection then
-        EnforceThirdPerson()
+    -- Aimbot
+    if State.Aimbot and aiming then
+        local target = getClosestTarget()
+        if target then
+            aimAt(target)
+        end
     end
 end)
 
--- ============================================================
--- Toy 個別固定管理
--- ============================================================
-local activeToys = {}   -- [Player] = { toy = Instance, conn = RBXScriptConnection }
-
-local function StopFixFor(plr)
-    local data = activeToys[plr]
-    if not data then return end
-    if data.conn then data.conn:Disconnect() end
-    if data.toy then
-        pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(data.toy)
-        end)
-    end
-    activeToys[plr] = nil
-end
-
-local function StartFixFor(plr)
-    if activeToys[plr] then return end
-    if not plr.Character then return end
-    local root = plr.Character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-
-    local existing = {}
-    local folder0 = workspace:FindFirstChild("i1aljSpawnedInToys")
-    if folder0 then
-        for _, v in ipairs(folder0:GetChildren()) do existing[v] = true end
-    end
-
-    pcall(function()
-        ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(table.unpack({
-            [1] = "SprayCanWD",
-            [2] = root.CFrame,
-            [3] = Vector3.new(0, 0, 0),
-        }))
-    end)
-
-    task.wait(0.15)
-
-    local folder = workspace:FindFirstChild("i1aljSpawnedInToys")
-    if not folder then return end
-
-    local newToy
-    for _, v in ipairs(folder:GetChildren()) do
-        if not existing[v] then newToy = v break end
-    end
-    if not newToy then return end
-
-    local conn = RunService.Heartbeat:Connect(function()
-        if not newToy or not newToy.Parent then
-            if activeToys[plr] and activeToys[plr].conn then
-                activeToys[plr].conn:Disconnect()
-            end
-            activeToys[plr] = nil
-            return
-        end
-        local char = plr.Character
-        if not char then return end
-        local r = char:FindFirstChild("HumanoidRootPart")
-        if not r then return end
-        pcall(function()
-            if newToy:IsA("BasePart") then
-                newToy.CFrame = r.CFrame
-            elseif newToy:IsA("Model") then
-                if not newToy.PrimaryPart then
-                    for _, p in ipairs(newToy:GetDescendants()) do
-                        if p:IsA("BasePart") then newToy.PrimaryPart = p break end
-                    end
-                end
-                if newToy.PrimaryPart then newToy:PivotTo(r.CFrame) end
-            end
-        end)
-    end)
-
-    activeToys[plr] = { toy = newToy, conn = conn }
-end
-
-local function StopAllFixes()
-    for plr, _ in pairs(activeToys) do
-        StopFixFor(plr)
-    end
-    Notify("Toy", "すべての固定を停止しました", 2)
-end
-
--- ============================================================
--- UI 非等方スケーリング（横幅・高さを個別倍率）
--- ============================================================
-local uiOriginalSizes = setmetatable({}, { __mode = "k" })
-local uiMulX, uiMulY   = 1, 1
-local uiLoopRunning    = false
-
-local function GetOrionScreenGui()
-    local parents = {}
-    if gethui then pcall(function() table.insert(parents, gethui()) end) end
-    pcall(function() table.insert(parents, game:GetService("CoreGui")) end)
-    pcall(function() table.insert(parents, LocalPlayer:FindFirstChild("PlayerGui")) end)
-
-    for _, p in ipairs(parents) do
-        if p then
-            for _, v in ipairs(p:GetChildren()) do
-                if v:IsA("ScreenGui") and v.Name == "Orion" then
-                    return v
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function ApplyUIScale()
-    local gui = GetOrionScreenGui()
-    if not gui then return end
-
-    for _, obj in ipairs(gui:GetDescendants()) do
-        if obj:IsA("GuiObject") then
-            if not uiOriginalSizes[obj] then
-                uiOriginalSizes[obj] = obj.Size
-            end
-            local orig = uiOriginalSizes[obj]
-            local newSize = UDim2.new(
-                orig.X.Scale  * uiMulX, orig.X.Offset * uiMulX,
-                orig.Y.Scale  * uiMulY, orig.Y.Offset * uiMulY
-            )
-            if obj.Size ~= newSize then
-                obj.Size = newSize
-            end
-        end
-    end
-end
-
-local function StartUILoop()
-    if uiLoopRunning then return end
-    uiLoopRunning = true
-    task.spawn(function()
-        while uiLoopRunning do
-            if uiMulX ~= 1 or uiMulY ~= 1 then
-                ApplyUIScale()
-            end
-            task.wait(0.3)
+-- プレイヤー参加/退出時のESP管理
+Players.PlayerAdded:Connect(function(plr)
+    plr.CharacterAdded:Connect(function()
+        if State.ESP then
+            createESP(plr)
         end
     end)
-end
-
--- ============================================================
--- Orion GUI 構築
--- ============================================================
-local Window = OrionLib:MakeWindow({
-    Name         = "Toy Controller",
-    HidePremium  = false,
-    SaveConfig   = false,
-    IntroEnabled = true,
-    IntroText    = "Toy Controller",
-    ConfigFolder = "ToyController"
-})
-
--- ---------- メイン ----------
-local MainTab = Window:MakeTab({
-    Name        = "メイン",
-    Icon        = "rbxassetid://4483345998",
-    PremiumOnly = false
-})
-
-local function GetSelectablePlayerNames()
-    local names = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            table.insert(names, plr.Name)
-        end
-    end
-    table.sort(names)
-    return names
-end
-
-local function FindPlayerByName(name)
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr.Name == name then return plr end
-    end
-    return nil
-end
-
-local PlayerDropdown
-PlayerDropdown = MainTab:AddDropdown({
-    Name    = "Toy固定するプレイヤー（複数選択）",
-    Options = GetSelectablePlayerNames(),
-    Default = {},
-    Multi   = true,
-    Callback = function(selected)
-        for plr, _ in pairs(activeToys) do
-            if not (selected and selected[plr.Name]) then
-                StopFixFor(plr)
-            end
-        end
-        if selected then
-            for name, isOn in pairs(selected) do
-                if isOn then
-                    local plr = FindPlayerByName(name)
-                    if plr and not activeToys[plr] then
-                        task.spawn(function() StartFixFor(plr) end)
-                    end
-                end
-            end
-        end
-    end
-})
-
-MainTab:AddButton({
-    Name = "プレイヤーリストを更新",
-    Callback = function()
-        local names = GetSelectablePlayerNames()
-        if PlayerDropdown and PlayerDropdown.Refresh then
-            PlayerDropdown:Refresh(names, true)
-        end
-        Notify("Toy", "プレイヤーリストを更新しました", 2)
-    end
-})
-
-MainTab:AddButton({
-    Name = "すべてのToy固定を停止",
-    Callback = function()
-        StopAllFixes()
-        if PlayerDropdown and PlayerDropdown.Refresh then
-            PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
-        end
-    end
-})
-
-MainTab:AddToggle({
-    Name     = "三人称化",
-    Default  = false,
-    Callback = function(value)
-        SetThirdPerson(value)
-    end
-})
-
-MainTab:AddToggle({
-    Name     = "Noclip",
-    Default  = false,
-    Callback = function(value)
-        SetNoclip(value)
-    end
-})
-
--- ---------- 設定 ----------
-local SettingsTab = Window:MakeTab({
-    Name        = "設定",
-    Icon        = "rbxassetid://4483345998",
-    PremiumOnly = false
-})
-
-SettingsTab:AddSlider({
-    Name      = "UI 横幅倍率",
-    Min       = 0.5,
-    Max       = 2,
-    Default   = 1,
-    Color     = Color3.fromRGB(80, 160, 255),
-    Increment = 0.05,
-    ValueName = "x",
-    Callback  = function(value)
-        uiMulX = value
-        ApplyUIScale()
-    end
-})
-
-SettingsTab:AddSlider({
-    Name      = "UI 高さ倍率",
-    Min       = 0.5,
-    Max       = 2,
-    Default   = 1,
-    Color     = Color3.fromRGB(255, 130, 130),
-    Increment = 0.05,
-    ValueName = "x",
-    Callback  = function(value)
-        uiMulY = value
-        ApplyUIScale()
-    end
-})
-
-SettingsTab:AddButton({
-    Name = "UIサイズをリセット",
-    Callback = function()
-        uiMulX, uiMulY = 1, 1
-        ApplyUIScale()
-        Notify("UI", "UIサイズをリセットしました", 2)
-    end
-})
-
-OrionLib:Init()
-StartUILoop()
-
--- Init 後に ScreenGui 生成を待って適用
-task.delay(1, function()
-    ApplyUIScale()
-end)
-
--- プレイヤー出入りの自動検知
-Players.PlayerAdded:Connect(function()
-    task.wait(0.5)
-    if PlayerDropdown and PlayerDropdown.Refresh then
-        PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
-    end
 end)
 
 Players.PlayerRemoving:Connect(function(plr)
-    StopFixFor(plr)
-    task.wait(0.2)
-    if PlayerDropdown and PlayerDropdown.Refresh then
-        PlayerDropdown:Refresh(GetSelectablePlayerNames(), true)
-    end
+    removeESP(plr)
 end)
+
+-- 既存プレイヤーのESP初期化
+for _, plr in pairs(Players:GetPlayers()) do
+    if plr ~= LocalPlayer then
+        createESP(plr)
+    end
+end
+
+-- ============================================================
+-- Orion UI 構築（モバイル向け）
+-- ============================================================
+local Window = OrionLib:MakeWindow({
+    Name = "FPS Script",
+    HidePremium = false,
+    SaveConfig = false,
+    IntroEnabled = true,
+    IntroText = "FPS Script Loading...",
+    ConfigFolder = "FPSScript"
+})
+
+-- ============================================================
+-- メインタブ
+-- ============================================================
+local MainTab = Window:MakeTab({
+    Name = "Main",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+-- ============================================================
+-- ESPセクション
+-- ============================================================
+local ESPSection = MainTab:AddSection({ Name = "ESP / Wallhack" })
+
+ESPSection:AddToggle({
+    Name = "ESP 有効",
+    Default = false,
+    Callback = function(Value)
+        State.ESP = Value
+        if Value then
+            for _, plr in pairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then
+                    createESP(plr)
+                end
+            end
+        else
+            for plr, _ in pairs(ESPObjects) do
+                removeESP(plr)
+            end
+        end
+        Notify("ESP", Value and "ESP を有効にしました" or "ESP を無効にしました", 2)
+    end
+})
+
+ESPSection:AddToggle({
+    Name = "チームチェック",
+    Default = true,
+    Callback = function(Value)
+        State.TeamCheck = Value
+    end
+})
+
+ESPSection:AddColorpicker({
+    Name = "ESPカラー（チームなし）",
+    Default = Color3.fromRGB(255, 0, 0),
+    Callback = function(Value)
+        State.ESPColor = Value
+    end
+})
+
+-- ============================================================
+-- Aimbotセクション
+-- ============================================================
+local AimSection = MainTab:AddSection({ Name = "Aimbot / Autoaim" })
+
+AimSection:AddToggle({
+    Name = "Aimbot 有効",
+    Default = false,
+    Callback = function(Value)
+        State.Aimbot = Value
+        Notify("Aimbot", Value and "Aimbot を有効にしました" or "Aimbot を無効にしました", 2)
+    end
+})
+
+AimSection:AddSlider({
+    Name = "FOV（視野範囲）",
+    Min = 50,
+    Max = 500,
+    Default = 150,
+    Color = Color3.fromRGB(255, 255, 255),
+    Increment = 10,
+    ValueName = "px",
+    Callback = function(Value)
+        State.FOV = Value
+    end
+})
+
+AimSection:AddToggle({
+    Name = "壁チェック",
+    Default = false,
+    Callback = function(Value)
+        State.WallCheck = Value
+    end
+})
+
+-- モバイル用エイムボタン（画面タップでエイム）
+AimSection:AddButton({
+    Name = "エイムボタン（タップで発動）",
+    Callback = function()
+        -- モバイルではR2ボタンが使えないため、
+        -- このボタンを押している間エイムする方式に
+        Notify("Aimbot", "R2ボタンでエイムしてください", 3)
+    end
+})
+
+-- ============================================================
+-- Noclipセクション
+-- ============================================================
+local NoclipSection = MainTab:AddSection({ Name = "Noclip" })
+
+NoclipSection:AddToggle({
+    Name = "Noclip 有効",
+    Default = false,
+    Callback = function(Value)
+        State.Noclip = Value
+        if Value then
+            enableNoclip()
+            Notify("Noclip", "Noclip を有効にしました", 2)
+        else
+            disableNoclip()
+            Notify("Noclip", "Noclip を無効にしました", 2)
+        end
+    end
+})
+
+-- ============================================================
+-- 終了通知
+-- ============================================================
+Notify("FPS Script", "スクリプトが読み込まれました", 3)
+
+-- UI初期化
+OrionLib:Init()
