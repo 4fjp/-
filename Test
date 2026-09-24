@@ -1,5 +1,5 @@
 --// ============================================
---// Toy Attacher (OrionLib / Mobile対応 / 起動安定版)
+--// Toy Attacher (Mobile対応 / マルチソース起動版)
 --// ============================================
 
 --// 設定
@@ -22,249 +22,403 @@ local function Notify(title, text, duration)
     end)
 end
 
---// ゲームの読み込み完了を待つ（起動失敗対策）
+--// ゲームの読み込み完了を待つ
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
---// OrionLib読み込み（失敗時はエラーを通知）
-local OrionLib
-do
-    local ok, err = pcall(function()
-        OrionLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Orion/main/source"))()
-    end)
-    if not ok or not OrionLib then
-        Notify("エラー", "OrionLibの読み込みに失敗: " .. tostring(err), 5)
+--// ============================================
+--// 共通ロジック
+--// ============================================
+
+local AttachedToy = nil
+local TargetName = ""
+local FirstPerson = false
+
+local function GetPlayerNames()
+    local list = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            table.insert(list, plr.Name)
+        end
+    end
+    return list
+end
+
+local function AttachToyTo(targetName)
+    local target = Players:FindFirstChild(targetName)
+    if not target then
+        Notify("エラー", "プレイヤーが見つかりません: " .. tostring(targetName), 3)
         return
+    end
+
+    local char = target.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        Notify("エラー", targetName .. " のHumanoidRootPartが見つかりません", 3)
+        return
+    end
+
+    if AttachedToy and AttachedToy.Parent then
+        pcall(function()
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
+        end)
+        task.wait(0.2)
+    end
+
+    local toyFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
+    if not toyFolder then
+        Notify("エラー", "i1aljSpawnedInToysが見つかりません", 3)
+        return
+    end
+
+    local spawnedToy = nil
+    local conn
+    conn = toyFolder.ChildAdded:Connect(function(child)
+        spawnedToy = child
+        conn:Disconnect()
+    end)
+
+    local spawnCF = hrp.CFrame
+    local ok, err = pcall(function()
+        ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(
+            ToyName,
+            spawnCF,
+            Vector3.new(0, -65.08200073242188, 0)
+        )
+    end)
+
+    if not ok then
+        conn:Disconnect()
+        Notify("エラー", tostring(err), 3)
+        return
+    end
+
+    local toy = nil
+    for _ = 1, 20 do
+        if spawnedToy and spawnedToy.Parent then
+            toy = spawnedToy
+            break
+        end
+        task.wait(0.25)
+    end
+    conn:Disconnect()
+
+    if not toy then
+        toy = toyFolder:FindFirstChild(ToyName)
+    end
+    if not toy then
+        Notify("エラー", "トイのスポーンを検出できませんでした", 3)
+        return
+    end
+
+    local basePart
+    if toy:IsA("BasePart") then
+        basePart = toy
+    elseif toy:IsA("Model") then
+        basePart = toy.PrimaryPart or toy:FindFirstChildWhichIsA("BasePart")
+    end
+    if not basePart then
+        Notify("エラー", "トイのパーツが見つかりません", 3)
+        return
+    end
+
+    basePart.CFrame = hrp.CFrame
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = hrp
+    weld.Part1 = basePart
+    weld.Parent = basePart
+
+    AttachedToy = toy
+    Notify("成功", targetName .. " の体に " .. ToyName .. " を固定しました", 3)
+end
+
+local function DestroyAttachedToy()
+    if AttachedToy and AttachedToy.Parent then
+        local ok, err = pcall(function()
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
+        end)
+        if ok then
+            AttachedToy = nil
+            Notify("削除", "トイを削除しました", 3)
+        else
+            Notify("エラー", tostring(err), 3)
+        end
+    else
+        Notify("情報", "固定中のトイがありません", 3)
     end
 end
 
---// 本体処理（万が一のエラーでGUI生成が止まらないよう保護）
-local okMain, errMain = pcall(function()
-
-    local Window = OrionLib:MakeWindow({
-        Name = "Toy Attacher",
-        HidePremium = false,
-        SaveConfig = false,
-        ConfigFolder = "ToyAttacherConfig"
-    })
-
-    local MainTab = Window:MakeTab({
-        Name = "Main",
-        Icon = "rbxassetid://4483345998",
-        PremiumOnly = false
-    })
-
-    --// 状態管理
-    local AttachedToy = nil
-    local TargetName = ""
-
-    --// プレイヤーリスト取得
-    local function GetPlayerNames()
-        local list = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                table.insert(list, plr.Name)
-            end
-        end
-        return list
+local function ToggleView(state)
+    FirstPerson = state
+    if state then
+        LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+        Notify("視点", "一人称に切り替えました", 2)
+    else
+        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+        Notify("視点", "三人称に切り替えました", 2)
     end
+end
 
-    --// トイを指定プレイヤーの体中心に固定
-    local function AttachToyTo(targetName)
-        local target = Players:FindFirstChild(targetName)
-        if not target then
-            Notify("エラー", "プレイヤーが見つかりません: " .. tostring(targetName), 3)
-            return
-        end
-
-        local char = target.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            Notify("エラー", targetName .. " のHumanoidRootPartが見つかりません", 3)
-            return
-        end
-
-        -- 既に固定中のトイを削除
-        if AttachedToy and AttachedToy.Parent then
-            pcall(function()
-                ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
-            end)
-            task.wait(0.2)
-        end
-
-        local toyFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
-        if not toyFolder then
-            Notify("エラー", "i1aljSpawnedInToysが見つかりません", 3)
-            return
-        end
-
-        -- スポーン検知
-        local spawnedToy = nil
-        local conn
-        conn = toyFolder.ChildAdded:Connect(function(child)
-            spawnedToy = child
-            conn:Disconnect()
+Players.PlayerRemoving:Connect(function(plr)
+    if AttachedToy and AttachedToy.Parent then
+        pcall(function()
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
         end)
-
-        local spawnCF = hrp.CFrame
-        local ok, err = pcall(function()
-            ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(
-                ToyName,
-                spawnCF,
-                Vector3.new(0, -65.08200073242188, 0)
-            )
-        end)
-
-        if not ok then
-            conn:Disconnect()
-            Notify("エラー", tostring(err), 3)
-            return
-        end
-
-        -- トイの出現待機
-        local toy = nil
-        for _ = 1, 20 do
-            if spawnedToy and spawnedToy.Parent then
-                toy = spawnedToy
-                break
-            end
-            task.wait(0.25)
-        end
-        conn:Disconnect()
-
-        if not toy then
-            toy = toyFolder:FindFirstChild(ToyName)
-        end
-        if not toy then
-            Notify("エラー", "トイのスポーンを検出できませんでした", 3)
-            return
-        end
-
-        -- ベースパーツ取得
-        local basePart
-        if toy:IsA("BasePart") then
-            basePart = toy
-        elseif toy:IsA("Model") then
-            basePart = toy.PrimaryPart or toy:FindFirstChildWhichIsA("BasePart")
-        end
-        if not basePart then
-            Notify("エラー", "トイのパーツが見つかりません", 3)
-            return
-        end
-
-        -- 体中心に固定（Weld）
-        basePart.CFrame = hrp.CFrame
-        local weld = Instance.new("WeldConstraint")
-        weld.Part0 = hrp
-        weld.Part1 = basePart
-        weld.Parent = basePart
-
-        AttachedToy = toy
-        Notify("成功", targetName .. " の体に " .. ToyName .. " を固定しました", 3)
+        AttachedToy = nil
     end
-
-    --// 固定中のトイを削除
-    local function DestroyAttachedToy()
-        if AttachedToy and AttachedToy.Parent then
-            local ok, err = pcall(function()
-                ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
-            end)
-            if ok then
-                AttachedToy = nil
-                Notify("削除", "トイを削除しました", 3)
-            else
-                Notify("エラー", tostring(err), 3)
-            end
-        else
-            Notify("情報", "固定中のトイがありません", 3)
-        end
-    end
-
-    --// ============================================
-    --// GUI構築
-    --// ============================================
-
-    MainTab:AddSection({Name = "対象プレイヤー選択"})
-
-    local TargetDropdown = MainTab:AddDropdown({
-        Name = "サーバーのプレイヤー",
-        Default = "",
-        Options = GetPlayerNames(),
-        Callback = function(value)
-            TargetName = value
-        end
-    })
-
-    MainTab:AddButton({
-        Name = "プレイヤーリスト更新",
-        Callback = function()
-            TargetDropdown:Refresh(GetPlayerNames(), true)
-            Notify("更新", "プレイヤーリストを更新しました", 2)
-        end
-    })
-
-    MainTab:AddTextbox({
-        Name = "ユーザー名を直接入力",
-        Default = "",
-        TextDisappear = false,
-        Callback = function(value)
-            TargetName = value
-        end
-    })
-
-    MainTab:AddSection({Name = "トイ操作"})
-
-    MainTab:AddButton({
-        Name = "体の中心に固定する",
-        Callback = function()
-            if TargetName == "" then
-                Notify("エラー", "対象プレイヤーを選択または入力してください", 3)
-                return
-            end
-            AttachToyTo(TargetName)
-        end
-    })
-
-    MainTab:AddButton({
-        Name = "固定したトイを削除",
-        Callback = function()
-            DestroyAttachedToy()
-        end
-    })
-
-    MainTab:AddSection({Name = "視点"})
-
-    MainTab:AddToggle({
-        Name = "一人称視点 (ON=一人称 / OFF=三人称)",
-        Default = false,
-        Callback = function(value)
-            if value then
-                LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
-                Notify("視点", "一人称に切り替えました", 2)
-            else
-                LocalPlayer.CameraMode = Enum.CameraMode.Classic
-                Notify("視点", "三人称に切り替えました", 2)
-            end
-        end
-    })
-
-    --// プレイヤー退出時のクリーンアップ
-    Players.PlayerRemoving:Connect(function(plr)
-        if AttachedToy and AttachedToy.Parent then
-            pcall(function()
-                ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
-            end)
-            AttachedToy = nil
-        end
-    end)
-
-    OrionLib:Init()
 end)
 
-if not okMain then
-    Notify("エラー", "起動中にエラー: " .. tostring(errMain), 5)
-    return
+--// ============================================
+--// OrionLib取得（複数ソースを順に試行）
+--// ============================================
+
+local function FetchSource(url)
+    local ok, res = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(res) == "string" and #res > 100 then
+        return res
+    end
+    local req = request or http_request or (http and http.request)
+    if req then
+        local ok2, r = pcall(function()
+            return req({
+                Url = url,
+                Method = "GET"
+            })
+        end)
+        if ok2 and r and type(r.Body) == "string" and #r.Body > 100 then
+            return r.Body
+        end
+    end
+    return nil
+end
+
+local OrionSources = {
+    "https://raw.githubusercontent.com/shlexware/Orion/main/source",
+    "https://github.com/shlexware/Orion/raw/main/source",
+    "https://cdn.jsdelivr.net/gh/shlexware/Orion@main/source",
+    "https://raw.fastgit.org/shlexware/Orion/main/source"
+}
+
+local OrionLib = nil
+for _, url in ipairs(OrionSources) do
+    local src = FetchSource(url)
+    if src then
+        local ok, lib = pcall(loadstring(src))
+        if ok and lib then
+            OrionLib = lib
+            Notify("読み込み", "OrionLibを取得しました", 2)
+            break
+        end
+    end
+end
+
+--// ============================================
+--// GUI構築（OrionLib成功時）
+--// ============================================
+
+if OrionLib then
+    local okMain, errMain = pcall(function()
+        local Window = OrionLib:MakeWindow({
+            Name = "Toy Attacher",
+            HidePremium = false,
+            SaveConfig = false,
+            ConfigFolder = "ToyAttacherConfig"
+        })
+
+        local MainTab = Window:MakeTab({
+            Name = "Main",
+            Icon = "rbxassetid://4483345998",
+            PremiumOnly = false
+        })
+
+        MainTab:AddSection({Name = "対象プレイヤー選択"})
+
+        local TargetDropdown = MainTab:AddDropdown({
+            Name = "サーバーのプレイヤー",
+            Default = "",
+            Options = GetPlayerNames(),
+            Callback = function(value)
+                TargetName = value
+            end
+        })
+
+        MainTab:AddButton({
+            Name = "プレイヤーリスト更新",
+            Callback = function()
+                TargetDropdown:Refresh(GetPlayerNames(), true)
+                Notify("更新", "プレイヤーリストを更新しました", 2)
+            end
+        })
+
+        MainTab:AddTextbox({
+            Name = "ユーザー名を直接入力",
+            Default = "",
+            TextDisappear = false,
+            Callback = function(value)
+                TargetName = value
+            end
+        })
+
+        MainTab:AddSection({Name = "トイ操作"})
+
+        MainTab:AddButton({
+            Name = "体の中心に固定する",
+            Callback = function()
+                if TargetName == "" then
+                    Notify("エラー", "対象プレイヤーを選択または入力してください", 3)
+                    return
+                end
+                AttachToyTo(TargetName)
+            end
+        })
+
+        MainTab:AddButton({
+            Name = "固定したトイを削除",
+            Callback = function()
+                DestroyAttachedToy()
+            end
+        })
+
+        MainTab:AddSection({Name = "視点"})
+
+        MainTab:AddToggle({
+            Name = "一人称視点 (ON=一人称 / OFF=三人称)",
+            Default = false,
+            Callback = function(value)
+                ToggleView(value)
+            end
+        })
+
+        OrionLib:Init()
+    end)
+
+    if not okMain then
+        Notify("エラー", "GUI生成エラー: " .. tostring(errMain), 5)
+    end
+
+else
+    --// ============================================
+    --// フォールバックGUI（OrionLib取得失敗時の内蔵GUI）
+    --// ============================================
+    Notify("情報", "OrionLib未取得のため内蔵GUIで起動します", 4)
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "ToyAttacherGUI"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local parented = false
+    pcall(function()
+        if gethui then
+            ScreenGui.Parent = gethui()
+            parented = true
+        end
+    end)
+    if not parented then
+        pcall(function()
+            ScreenGui.Parent = game:GetService("CoreGui")
+            parented = true
+        end)
+    end
+    if not parented then
+        ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    -- 開閉ボタン
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Size = UDim2.new(0, 50, 0, 50)
+    ToggleBtn.Position = UDim2.new(0, 10, 0.5, -25)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ToggleBtn.Text = "開く"
+    ToggleBtn.Font = Enum.Font.GothamBold
+    ToggleBtn.TextSize = 14
+    ToggleBtn.Parent = ScreenGui
+    Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 8)
+
+    -- メインフレーム
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Size = UDim2.new(0, 260, 0, 320)
+    MainFrame.Position = UDim2.new(0.5, -130, 0.5, -160)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    MainFrame.Visible = false
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.Parent = ScreenGui
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, 0, 0, 40)
+    Title.BackgroundTransparency = 1
+    Title.Text = "Toy Attacher"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 18
+    Title.Parent = MainFrame
+
+    -- ユーザー名入力
+    local NameBox = Instance.new("TextBox")
+    NameBox.Size = UDim2.new(1, -20, 0, 40)
+    NameBox.Position = UDim2.new(0, 10, 0, 50)
+    NameBox.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    NameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    NameBox.PlaceholderText = "対象プレイヤー名を入力"
+    NameBox.Text = ""
+    NameBox.Font = Enum.Font.Gotham
+    NameBox.TextSize = 14
+    NameBox.ClearTextOnFocus = false
+    NameBox.Parent = MainFrame
+    Instance.new("UICorner", NameBox).CornerRadius = UDim.new(0, 6)
+
+    -- ボタン生成ヘルパー
+    local function MakeButton(text, yPos, callback)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -20, 0, 40)
+        btn.Position = UDim2.new(0, 10, 0, yPos)
+        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Text = text
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 14
+        btn.Parent = MainFrame
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        btn.MouseButton1Click:Connect(function()
+            pcall(callback)
+        end)
+        return btn
+    end
+
+    MakeButton("体の中心に固定する", 100, function()
+        local name = NameBox.Text
+        if name == "" then
+            Notify("エラー", "対象プレイヤー名を入力してください", 3)
+            return
+        end
+        TargetName = name
+        AttachToyTo(name)
+    end)
+
+    MakeButton("固定したトイを削除", 150, function()
+        DestroyAttachedToy()
+    end)
+
+    local ViewBtn = MakeButton("視点: 三人称", 200, function()
+        ToggleView(not FirstPerson)
+        ViewBtn.Text = FirstPerson and "視点: 一人称" or "視点: 三人称"
+    end)
+
+    MakeButton("GUIを閉じる", 250, function()
+        MainFrame.Visible = false
+        ToggleBtn.Text = "開く"
+    end)
+
+    ToggleBtn.MouseButton1Click:Connect(function()
+        MainFrame.Visible = not MainFrame.Visible
+        ToggleBtn.Text = MainFrame.Visible and "閉じる" or "開く"
+    end)
 end
 
 Notify("読み込み完了", "Toy Attacherを起動しました", 3)
