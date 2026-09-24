@@ -14,7 +14,7 @@ local StarterGui        = game:GetService("StarterGui")
 local LocalPlayer = Players.LocalPlayer
 
 -- ============================================================
--- Notify (print は使用しない)
+-- Notify
 -- ============================================================
 local function Notify(title, text, duration)
     StarterGui:SetCore("SendNotification", {
@@ -25,198 +25,309 @@ local function Notify(title, text, duration)
 end
 
 -- ============================================================
--- ターゲット自動取得（最寄りの他プレイヤー）
+-- Noclip
 -- ============================================================
-local function GetNearestTarget()
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
+local noclipEnabled    = false
+local noclipConnection = nil
 
-    local closest, dist = nil, math.huge
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local root = plr.Character:FindFirstChild("HumanoidRootPart")
-            if root then
-                local d = (root.Position - myRoot.Position).Magnitude
-                if d < dist then
-                    closest = plr
-                    dist = d
+local function SetNoclip(state)
+    noclipEnabled = state
+    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
+
+    if state then
+        noclipConnection = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
                 end
             end
-        end
+        end)
+        Notify("Noclip", "有効", 2)
+    else
+        Notify("Noclip", "無効", 2)
     end
-    return closest
 end
 
 -- ============================================================
--- 状態管理
+-- カメラ視点切替（毎フレーム強制適用）
 -- ============================================================
-local currentToy        = nil
-local fixConnection     = nil
-local currentTarget     = nil
-local viewIsFirstPerson = false
+local viewIsFirstPerson      = false
+local viewEnforceConnection  = nil
+
+local function EnforceView()
+    if viewIsFirstPerson then
+        if LocalPlayer.CameraMode ~= Enum.CameraMode.LockFirstPerson then
+            LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+        end
+        if LocalPlayer.CameraMinZoomDistance ~= 0.5 then
+            LocalPlayer.CameraMinZoomDistance = 0.5
+        end
+        if LocalPlayer.CameraMaxZoomDistance ~= 0.5 then
+            LocalPlayer.CameraMaxZoomDistance = 0.5
+        end
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.CameraOffset ~= Vector3.new(0, 0.5, 0) then
+                hum.CameraOffset = Vector3.new(0, 0.5, 0)
+            end
+        end
+    else
+        if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
+            LocalPlayer.CameraMode = Enum.CameraMode.Classic
+        end
+        if LocalPlayer.CameraMinZoomDistance ~= 0.5 then
+            LocalPlayer.CameraMinZoomDistance = 0.5
+        end
+        if LocalPlayer.CameraMaxZoomDistance ~= 128 then
+            LocalPlayer.CameraMaxZoomDistance = 128
+        end
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.CameraOffset ~= Vector3.new(0, 0, 0) then
+                hum.CameraOffset = Vector3.new(0, 0, 0)
+            end
+        end
+    end
+end
+
+local function ApplyView(firstPerson)
+    viewIsFirstPerson = firstPerson
+    EnforceView()
+
+    if viewEnforceConnection then viewEnforceConnection:Disconnect() end
+    viewEnforceConnection = RunService.RenderStepped:Connect(EnforceView)
+
+    Notify("View", firstPerson and "一人称視点" or "三人称視点", 2)
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    EnforceView()
+end)
 
 -- ============================================================
--- Toy生成 & 体の中心に固定
+-- Toy 複数人同時固定
 -- ============================================================
-local function SpawnAndFix()
-    local target = GetNearestTarget()
-    if not target or not target.Character then
-        Notify("Toy", "ターゲットが見つかりません", 3)
-        return
-    end
-    local root = target.Character:FindFirstChild("HumanoidRootPart")
-    if not root then
-        Notify("Toy", "HumanoidRootPartが見つかりません", 3)
-        return
-    end
+local activeToys       = {}   -- [Player] = { toy = Instance, conn = RBXScriptConnection }
+local multiFixRunning  = false
 
-    -- 前回の接続とToyをクリーンアップ
-    if fixConnection then fixConnection:Disconnect() fixConnection = nil end
-    if currentToy then
+local function StartLockForPlayer(plr, toy)
+    local conn = RunService.Heartbeat:Connect(function()
+        if not toy or not toy.Parent then
+            if activeToys[plr] then
+                if activeToys[plr].conn then activeToys[plr].conn:Disconnect() end
+                activeToys[plr] = nil
+            end
+            return
+        end
+        local char = plr.Character
+        if not char then return end
+        local r = char:FindFirstChild("HumanoidRootPart")
+        if not r then return end
         pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(currentToy)
+            if toy:IsA("BasePart") then
+                toy.CFrame = r.CFrame
+            elseif toy:IsA("Model") then
+                if not toy.PrimaryPart then
+                    for _, p in ipairs(toy:GetDescendants()) do
+                        if p:IsA("BasePart") then toy.PrimaryPart = p break end
+                    end
+                end
+                if toy.PrimaryPart then toy:PivotTo(r.CFrame) end
+            end
         end)
-        currentToy = nil
+    end)
+    activeToys[plr] = { toy = toy, conn = conn }
+end
+
+local function SpawnToyForPlayer(plr)
+    if not plr.Character then return end
+    local root = plr.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    -- 生成前に既存Toyを記録
+    local existing = {}
+    local folder0 = workspace:FindFirstChild("i1aljSpawnedInToys")
+    if folder0 then
+        for _, v in ipairs(folder0:GetChildren()) do existing[v] = true end
     end
 
-    currentTarget = target
-
-    -- ターゲットのRoot位置でToyを生成
-    local cframe = root.CFrame
     pcall(function()
         ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(table.unpack({
             [1] = "SprayCanWD",
-            [2] = cframe,
+            [2] = root.CFrame,
             [3] = Vector3.new(0, 0, 0),
         }))
     end)
 
     task.wait(0.15)
 
-    local toysFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
-    if toysFolder then
-        currentToy = toysFolder:FindFirstChild("SprayCanWD")
-    end
+    local folder = workspace:FindFirstChild("i1aljSpawnedInToys")
+    if not folder then return end
 
-    if not currentToy then
-        Notify("Toy", "Toyの生成に失敗しました", 3)
-        return
-    end
-
-    -- 毎フレーム、Toyをターゲットの体の中心に固定
-    fixConnection = RunService.Heartbeat:Connect(function()
-        if not currentToy or not currentToy.Parent then
-            if fixConnection then fixConnection:Disconnect() fixConnection = nil end
-            return
+    local newToy
+    for _, v in ipairs(folder:GetChildren()) do
+        if not existing[v] then
+            newToy = v
+            break
         end
-        local char = currentTarget and currentTarget.Character
-        if not char then return end
-        local r = char:FindFirstChild("HumanoidRootPart")
-        if not r then return end
+    end
 
-        pcall(function()
-            if currentToy:IsA("BasePart") then
-                currentToy.CFrame = r.CFrame
-            elseif currentToy:IsA("Model") then
-                if not currentToy.PrimaryPart then
-                    for _, p in ipairs(currentToy:GetDescendants()) do
-                        if p:IsA("BasePart") then
-                            currentToy.PrimaryPart = p
-                            break
-                        end
-                    end
-                end
-                if currentToy.PrimaryPart then
-                    currentToy:PivotTo(r.CFrame)
-                end
-            end
-        end)
-    end)
-
-    Notify("Toy", currentTarget.Name .. " にToyを固定しました", 3)
+    if newToy then
+        StartLockForPlayer(plr, newToy)
+    end
 end
 
-local function StopFix()
-    if fixConnection then fixConnection:Disconnect() fixConnection = nil end
-    if currentToy then
-        pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(currentToy)
-        end)
-        currentToy = nil
+local function StartMultiFix()
+    if multiFixRunning then return end
+    multiFixRunning = true
+
+    task.spawn(function()
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                SpawnToyForPlayer(plr)
+                task.wait(0.2)
+            end
+        end
+        Notify("Toy", "サーバー内全員にToyを固定しました", 3)
+        multiFixRunning = false
+    end)
+end
+
+local function StopMultiFix()
+    multiFixRunning = false
+    for plr, data in pairs(activeToys) do
+        if data.conn then data.conn:Disconnect() end
+        if data.toy then
+            pcall(function()
+                ReplicatedStorage.MenuToys.DestroyToy:FireServer(data.toy)
+            end)
+        end
     end
-    currentTarget = nil
+    activeToys = {}
     Notify("Toy", "固定を停止しました", 2)
 end
 
 -- ============================================================
--- カメラ視点切り替え（一人称 / 三人称）
+-- UI 設定（Orion の ScreenGui に UIScale を適用）
 -- ============================================================
-local function ApplyView(firstPerson)
-    viewIsFirstPerson = firstPerson
-    if firstPerson then
-        LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then hum.CameraOffset = Vector3.new(0, 0.5, 0) end
+local function GetOrionScreenGui()
+    local parents = {}
+    if gethui then pcall(function() table.insert(parents, gethui()) end) end
+    pcall(function() table.insert(parents, game:GetService("CoreGui")) end)
+    pcall(function() table.insert(parents, LocalPlayer:FindFirstChild("PlayerGui")) end)
+
+    for _, p in ipairs(parents) do
+        if p then
+            for _, v in ipairs(p:GetChildren()) do
+                if v:IsA("ScreenGui") and v.Name == "Orion" then
+                    return v
+                end
+            end
         end
-        Notify("View", "一人称視点", 2)
-    else
-        LocalPlayer.CameraMode = Enum.CameraMode.Classic
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then hum.CameraOffset = Vector3.new(0, 0, 0) end
-        end
-        Notify("View", "三人称視点", 2)
     end
+    return nil
 end
 
--- リスポーン後に視点設定を再適用
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    ApplyView(viewIsFirstPerson)
-end)
+local uiScaleValue = 1
+
+local function ApplyUIScale(value)
+    uiScaleValue = value
+    local gui = GetOrionScreenGui()
+    if not gui then return end
+    local scale = gui:FindFirstChild("__UIScale")
+    if not scale then
+        scale = Instance.new("UIScale")
+        scale.Name = "__UIScale"
+        scale.Parent = gui
+    end
+    scale.Scale = value
+end
 
 -- ============================================================
--- Orionlib GUI（ウィンドウはデフォルトでドラッグ移動可能）
+-- Orion GUI 構築
 -- ============================================================
 local Window = OrionLib:MakeWindow({
-    Name           = "Toy Controller",
-    HidePremium    = false,
-    SaveConfig     = false,
-    IntroEnabled   = true,
-    IntroText      = "Toy Controller",
-    ConfigFolder   = "ToyController"
+    Name          = "Toy Controller",
+    HidePremium   = false,
+    SaveConfig    = false,
+    IntroEnabled  = true,
+    IntroText     = "Toy Controller",
+    ConfigFolder  = "ToyController"
 })
 
+-- ---------- メイン ----------
 local MainTab = Window:MakeTab({
-    Name         = "メイン",
-    Icon         = "rbxassetid://4483345998",
-    PremiumOnly  = false
+    Name        = "メイン",
+    Icon        = "rbxassetid://4483345998",
+    PremiumOnly = false
 })
 
 MainTab:AddButton({
-    Name = "Toyをターゲットに固定",
+    Name = "サーバー全員にToyを固定",
     Callback = function()
-        SpawnAndFix()
+        StartMultiFix()
     end
 })
 
 MainTab:AddButton({
     Name = "Toy固定を停止",
     Callback = function()
-        StopFix()
+        StopMultiFix()
     end
 })
 
 MainTab:AddToggle({
-    Name    = "一人称視点",
-    Default = false,
+    Name     = "一人称視点",
+    Default  = false,
     Callback = function(value)
         ApplyView(value)
     end
 })
 
+MainTab:AddToggle({
+    Name     = "Noclip",
+    Default  = false,
+    Callback = function(value)
+        SetNoclip(value)
+    end
+})
+
+-- ---------- 設定 ----------
+local SettingsTab = Window:MakeTab({
+    Name        = "設定",
+    Icon        = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+SettingsTab:AddSlider({
+    Name      = "UIスケール（縦横比）",
+    Min       = 0.5,
+    Max       = 2,
+    Default   = 1,
+    Color     = Color3.fromRGB(80, 160, 255),
+    Increment = 0.05,
+    ValueName = "x",
+    Callback  = function(value)
+        ApplyUIScale(value)
+    end
+})
+
+SettingsTab:AddButton({
+    Name = "UIスケールをリセット",
+    Callback = function()
+        ApplyUIScale(1)
+        Notify("UI", "UIスケールを1.0xに戻しました", 2)
+    end
+})
+
 OrionLib:Init()
 
+-- Init 後に Orion ScreenGui が生成されるため遅延で再適用
+task.delay(1, function()
+    ApplyUIScale(uiScaleValue)
+end)
