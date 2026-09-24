@@ -1,5 +1,5 @@
 --// ============================================
---// Toy Attacher (OrionLib / jensonhirst版)
+--// Toy Attacher (OrionLib / タッチドラッグ対応・追従方式)
 --// ============================================
 
 --// 設定
@@ -9,6 +9,8 @@ local ToyName = "SprayCanWD" -- 固定するトイ名
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 --// Notify（printは使用しない）
@@ -84,7 +86,15 @@ end
 --// ============================================
 
 local AttachedToy = nil
+local FollowConnection = nil
 local TargetName = ""
+
+local function StopFollowing()
+    if FollowConnection then
+        FollowConnection:Disconnect()
+        FollowConnection = nil
+    end
+end
 
 local function GetPlayerNames()
     local list = {}
@@ -97,6 +107,8 @@ local function GetPlayerNames()
 end
 
 local function AttachToyTo(targetName)
+    Notify("処理中", "召喚リクエストを送信中...", 2)
+
     local target = Players:FindFirstChild(targetName)
     if not target then
         Notify("エラー", "プレイヤーが見つかりません: " .. tostring(targetName), 3)
@@ -110,11 +122,13 @@ local function AttachToyTo(targetName)
         return
     end
 
+    -- 既に固定中のトイを削除
+    StopFollowing()
     if AttachedToy and AttachedToy.Parent then
         pcall(function()
             ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
         end)
-        task.wait(0.2)
+        task.wait(0.3)
     end
 
     local toyFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
@@ -141,12 +155,14 @@ local function AttachToyTo(targetName)
 
     if not ok then
         conn:Disconnect()
-        Notify("エラー", tostring(err), 3)
+        Notify("エラー", "召喚失敗: " .. tostring(err), 4)
         return
     end
 
+    Notify("処理中", "トイの出現を待機中...", 2)
+
     local toy = nil
-    for _ = 1, 20 do
+    for _ = 1, 24 do
         if spawnedToy and spawnedToy.Parent then
             toy = spawnedToy
             break
@@ -163,6 +179,9 @@ local function AttachToyTo(targetName)
         return
     end
 
+    Notify("検出", "トイ検出: " .. toy.Name, 2)
+
+    -- ベースパーツ取得
     local basePart
     if toy:IsA("BasePart") then
         basePart = toy
@@ -174,17 +193,26 @@ local function AttachToyTo(targetName)
         return
     end
 
-    basePart.CFrame = hrp.CFrame
-    local weld = Instance.new("WeldConstraint")
-    weld.Part0 = hrp
-    weld.Part1 = basePart
-    weld.Parent = basePart
+    -- ローカルでアンカー（物理との競合を防ぐ）
+    pcall(function() basePart.Anchored = true end)
+
+    -- 毎フレーム体中心に追従
+    FollowConnection = RunService.Heartbeat:Connect(function()
+        local c = target.Character
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        if root and toy.Parent then
+            pcall(function()
+                basePart.CFrame = root.CFrame
+            end)
+        end
+    end)
 
     AttachedToy = toy
     Notify("成功", targetName .. " の体に " .. ToyName .. " を固定しました", 3)
 end
 
 local function DestroyAttachedToy()
+    StopFollowing()
     if AttachedToy and AttachedToy.Parent then
         local ok, err = pcall(function()
             ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
@@ -196,6 +224,7 @@ local function DestroyAttachedToy()
             Notify("エラー", tostring(err), 3)
         end
     else
+        AttachedToy = nil
         Notify("情報", "固定中のトイがありません", 3)
     end
 end
@@ -210,6 +239,7 @@ local function ToggleView(state)
     end
 end
 
+--// ターゲットのキャラがリスポーンしても追従し続ける
 Players.PlayerRemoving:Connect(function(plr)
     if AttachedToy and AttachedToy.Parent then
         pcall(function()
@@ -217,6 +247,7 @@ Players.PlayerRemoving:Connect(function(plr)
         end)
         AttachedToy = nil
     end
+    StopFollowing()
 end)
 
 --// ============================================
@@ -274,14 +305,16 @@ local okMain, errMain = pcall(function()
                 Notify("エラー", "対象プレイヤーを選択または入力してください", 3)
                 return
             end
-            AttachToyTo(TargetName)
+            task.spawn(function()
+                AttachToyTo(TargetName)
+            end)
         end
     })
 
     MainTab:AddButton({
         Name = "固定したトイを削除",
         Callback = function()
-            DestroyAttachedToy()
+            task.spawn(DestroyAttachedToy)
         end
     })
 
@@ -303,5 +336,74 @@ if not okMain then
     return
 end
 
+--// ============================================
+--// タッチ対応ドラッグ処理（OrionLibウィンドウに追加）
+--// ============================================
+
+task.spawn(function()
+    task.wait(1)
+
+    local orionGui = nil
+    if gethui then
+        orionGui = gethui():FindFirstChild("Orion")
+    end
+    if not orionGui then
+        orionGui = game:GetService("CoreGui"):FindFirstChild("Orion")
+    end
+    if not orionGui then
+        orionGui = LocalPlayer.PlayerGui:FindFirstChild("Orion")
+    end
+
+    if not orionGui then
+        Notify("情報", "Orionウィンドウを検出できませんでした", 3)
+        return
+    end
+
+    local mainFrame = orionGui:FindFirstChild("MainFrame") or orionGui:FindFirstChildWhichIsA("Frame", true)
+    if not mainFrame then
+        Notify("情報", "メインフレームを検出できませんでした", 3)
+        return
+    end
+
+    local dragHandle = mainFrame:FindFirstChild("TopBar") or mainFrame:FindFirstChild("TitleBar") or mainFrame
+
+    local dragging = false
+    local dragInput = nil
+    local startPos = nil
+    local startInputPos = nil
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            startInputPos = input.Position
+            startPos = mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    dragHandle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - startInputPos
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    Notify("情報", "タッチドラッグを有効化しました", 2)
+end)
+
 Notify("読み込み完了", "Toy Attacherを起動しました", 3)
+
 
