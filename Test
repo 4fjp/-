@@ -1,409 +1,222 @@
---// ============================================
---// Toy Attacher (OrionLib / タッチドラッグ対応・追従方式)
---// ============================================
+-- ============================================================
+-- Toy Controller (Mobile / Orionlib - Qanuir/orion-ui)
+-- ============================================================
 
---// 設定
-local ToyName = "SprayCanWD" -- 固定するトイ名
+local OrionLib = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/Qanuir/orion-ui/refs/heads/main/source.lua"
+))()
 
---// Services
-local Players = game:GetService("Players")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local StarterGui = game:GetService("StarterGui")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local StarterGui        = game:GetService("StarterGui")
+
 local LocalPlayer = Players.LocalPlayer
 
---// Notify（printは使用しない）
+-- ============================================================
+-- Notify (print は使用しない)
+-- ============================================================
 local function Notify(title, text, duration)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = tostring(title),
-            Text = tostring(text),
-            Duration = duration or 3
-        })
-    end)
+    StarterGui:SetCore("SendNotification", {
+        Title    = title,
+        Text     = text,
+        Duration = duration
+    })
 end
 
---// ゲームの読み込み完了を待つ
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
+-- ============================================================
+-- ターゲット自動取得（最寄りの他プレイヤー）
+-- ============================================================
+local function GetNearestTarget()
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
 
---// ============================================
---// OrionLib取得（新リポジトリ jensonhirst を優先）
---// ============================================
-
-local function FetchSource(url)
-    local ok, res = pcall(function()
-        return game:HttpGet(url)
-    end)
-    if ok and type(res) == "string" and #res > 100 then
-        return res
-    end
-    local req = request or http_request or (http and http.request)
-    if req then
-        local ok2, r = pcall(function()
-            return req({ Url = url, Method = "GET" })
-        end)
-        if ok2 and r and type(r.Body) == "string" and #r.Body > 100 then
-            return r.Body
-        end
-    end
-    return nil
-end
-
-local OrionSources = {
-    "https://raw.githubusercontent.com/jensonhirst/Orion/main/source",
-    "https://github.com/jensonhirst/Orion/raw/main/source",
-    "https://cdn.jsdelivr.net/gh/jensonhirst/Orion@main/source",
-    "https://raw.githubusercontent.com/shlexware/Orion/main/source"
-}
-
-local OrionLib = nil
-local lastError = "不明"
-for _, url in ipairs(OrionSources) do
-    local src = FetchSource(url)
-    if src then
-        local ok, lib = pcall(loadstring(src))
-        if ok and lib then
-            OrionLib = lib
-            break
-        else
-            lastError = tostring(lib)
-        end
-    else
-        lastError = "取得失敗: " .. url
-    end
-end
-
-if not OrionLib then
-    Notify("エラー", "OrionLib取得失敗: " .. lastError, 6)
-    return
-end
-
---// ============================================
---// 本体処理
---// ============================================
-
-local AttachedToy = nil
-local FollowConnection = nil
-local TargetName = ""
-
-local function StopFollowing()
-    if FollowConnection then
-        FollowConnection:Disconnect()
-        FollowConnection = nil
-    end
-end
-
-local function GetPlayerNames()
-    local list = {}
+    local closest, dist = nil, math.huge
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            table.insert(list, plr.Name)
+        if plr ~= LocalPlayer and plr.Character then
+            local root = plr.Character:FindFirstChild("HumanoidRootPart")
+            if root then
+                local d = (root.Position - myRoot.Position).Magnitude
+                if d < dist then
+                    closest = plr
+                    dist = d
+                end
+            end
         end
     end
-    return list
+    return closest
 end
 
-local function AttachToyTo(targetName)
-    Notify("処理中", "召喚リクエストを送信中...", 2)
+-- ============================================================
+-- 状態管理
+-- ============================================================
+local currentToy        = nil
+local fixConnection     = nil
+local currentTarget     = nil
+local viewIsFirstPerson = false
 
-    local target = Players:FindFirstChild(targetName)
-    if not target then
-        Notify("エラー", "プレイヤーが見つかりません: " .. tostring(targetName), 3)
+-- ============================================================
+-- Toy生成 & 体の中心に固定
+-- ============================================================
+local function SpawnAndFix()
+    local target = GetNearestTarget()
+    if not target or not target.Character then
+        Notify("Toy", "ターゲットが見つかりません", 3)
+        return
+    end
+    local root = target.Character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        Notify("Toy", "HumanoidRootPartが見つかりません", 3)
         return
     end
 
-    local char = target.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then
-        Notify("エラー", targetName .. " のHumanoidRootPartが見つかりません", 3)
-        return
-    end
-
-    -- 既に固定中のトイを削除
-    StopFollowing()
-    if AttachedToy and AttachedToy.Parent then
+    -- 前回の接続とToyをクリーンアップ
+    if fixConnection then fixConnection:Disconnect() fixConnection = nil end
+    if currentToy then
         pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(currentToy)
         end)
-        task.wait(0.3)
+        currentToy = nil
     end
 
-    local toyFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
-    if not toyFolder then
-        Notify("エラー", "i1aljSpawnedInToysが見つかりません", 3)
+    currentTarget = target
+
+    -- ターゲットのRoot位置でToyを生成
+    local cframe = root.CFrame
+    pcall(function()
+        ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(table.unpack({
+            [1] = "SprayCanWD",
+            [2] = cframe,
+            [3] = Vector3.new(0, 0, 0),
+        }))
+    end)
+
+    task.wait(0.15)
+
+    local toysFolder = workspace:FindFirstChild("i1aljSpawnedInToys")
+    if toysFolder then
+        currentToy = toysFolder:FindFirstChild("SprayCanWD")
+    end
+
+    if not currentToy then
+        Notify("Toy", "Toyの生成に失敗しました", 3)
         return
     end
 
-    local spawnedToy = nil
-    local conn
-    conn = toyFolder.ChildAdded:Connect(function(child)
-        spawnedToy = child
-        conn:Disconnect()
-    end)
-
-    local spawnCF = hrp.CFrame
-    local ok, err = pcall(function()
-        ReplicatedStorage.MenuToys.SpawnToyRemoteFunction:InvokeServer(
-            ToyName,
-            spawnCF,
-            Vector3.new(0, -65.08200073242188, 0)
-        )
-    end)
-
-    if not ok then
-        conn:Disconnect()
-        Notify("エラー", "召喚失敗: " .. tostring(err), 4)
-        return
-    end
-
-    Notify("処理中", "トイの出現を待機中...", 2)
-
-    local toy = nil
-    for _ = 1, 24 do
-        if spawnedToy and spawnedToy.Parent then
-            toy = spawnedToy
-            break
+    -- 毎フレーム、Toyをターゲットの体の中心に固定
+    fixConnection = RunService.Heartbeat:Connect(function()
+        if not currentToy or not currentToy.Parent then
+            if fixConnection then fixConnection:Disconnect() fixConnection = nil end
+            return
         end
-        task.wait(0.25)
-    end
-    conn:Disconnect()
+        local char = currentTarget and currentTarget.Character
+        if not char then return end
+        local r = char:FindFirstChild("HumanoidRootPart")
+        if not r then return end
 
-    if not toy then
-        toy = toyFolder:FindFirstChild(ToyName)
-    end
-    if not toy then
-        Notify("エラー", "トイのスポーンを検出できませんでした", 3)
-        return
-    end
-
-    Notify("検出", "トイ検出: " .. toy.Name, 2)
-
-    -- ベースパーツ取得
-    local basePart
-    if toy:IsA("BasePart") then
-        basePart = toy
-    elseif toy:IsA("Model") then
-        basePart = toy.PrimaryPart or toy:FindFirstChildWhichIsA("BasePart")
-    end
-    if not basePart then
-        Notify("エラー", "トイのパーツが見つかりません", 3)
-        return
-    end
-
-    -- ローカルでアンカー（物理との競合を防ぐ）
-    pcall(function() basePart.Anchored = true end)
-
-    -- 毎フレーム体中心に追従
-    FollowConnection = RunService.Heartbeat:Connect(function()
-        local c = target.Character
-        local root = c and c:FindFirstChild("HumanoidRootPart")
-        if root and toy.Parent then
-            pcall(function()
-                basePart.CFrame = root.CFrame
-            end)
-        end
+        pcall(function()
+            if currentToy:IsA("BasePart") then
+                currentToy.CFrame = r.CFrame
+            elseif currentToy:IsA("Model") then
+                if not currentToy.PrimaryPart then
+                    for _, p in ipairs(currentToy:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            currentToy.PrimaryPart = p
+                            break
+                        end
+                    end
+                end
+                if currentToy.PrimaryPart then
+                    currentToy:PivotTo(r.CFrame)
+                end
+            end
+        end)
     end)
 
-    AttachedToy = toy
-    Notify("成功", targetName .. " の体に " .. ToyName .. " を固定しました", 3)
+    Notify("Toy", currentTarget.Name .. " にToyを固定しました", 3)
 end
 
-local function DestroyAttachedToy()
-    StopFollowing()
-    if AttachedToy and AttachedToy.Parent then
-        local ok, err = pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
+local function StopFix()
+    if fixConnection then fixConnection:Disconnect() fixConnection = nil end
+    if currentToy then
+        pcall(function()
+            ReplicatedStorage.MenuToys.DestroyToy:FireServer(currentToy)
         end)
-        if ok then
-            AttachedToy = nil
-            Notify("削除", "トイを削除しました", 3)
-        else
-            Notify("エラー", tostring(err), 3)
-        end
-    else
-        AttachedToy = nil
-        Notify("情報", "固定中のトイがありません", 3)
+        currentToy = nil
     end
+    currentTarget = nil
+    Notify("Toy", "固定を停止しました", 2)
 end
 
-local function ToggleView(state)
-    if state then
+-- ============================================================
+-- カメラ視点切り替え（一人称 / 三人称）
+-- ============================================================
+local function ApplyView(firstPerson)
+    viewIsFirstPerson = firstPerson
+    if firstPerson then
         LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
-        Notify("視点", "一人称に切り替えました", 2)
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.CameraOffset = Vector3.new(0, 0.5, 0) end
+        end
+        Notify("View", "一人称視点", 2)
     else
         LocalPlayer.CameraMode = Enum.CameraMode.Classic
-        Notify("視点", "三人称に切り替えました", 2)
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.CameraOffset = Vector3.new(0, 0, 0) end
+        end
+        Notify("View", "三人称視点", 2)
     end
 end
 
---// ターゲットのキャラがリスポーンしても追従し続ける
-Players.PlayerRemoving:Connect(function(plr)
-    if AttachedToy and AttachedToy.Parent then
-        pcall(function()
-            ReplicatedStorage.MenuToys.DestroyToy:FireServer(AttachedToy)
-        end)
-        AttachedToy = nil
-    end
-    StopFollowing()
+-- リスポーン後に視点設定を再適用
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    ApplyView(viewIsFirstPerson)
 end)
 
---// ============================================
---// GUI構築（OrionLib）
---// ============================================
+-- ============================================================
+-- Orionlib GUI（ウィンドウはデフォルトでドラッグ移動可能）
+-- ============================================================
+local Window = OrionLib:MakeWindow({
+    Name           = "Toy Controller",
+    HidePremium    = false,
+    SaveConfig     = false,
+    IntroEnabled   = true,
+    IntroText      = "Toy Controller",
+    ConfigFolder   = "ToyController"
+})
 
-local okMain, errMain = pcall(function()
-    local Window = OrionLib:MakeWindow({
-        Name = "Toy Attacher",
-        HidePremium = false,
-        SaveConfig = false,
-        ConfigFolder = "ToyAttacherConfig"
-    })
+local MainTab = Window:MakeTab({
+    Name         = "メイン",
+    Icon         = "rbxassetid://4483345998",
+    PremiumOnly  = false
+})
 
-    local MainTab = Window:MakeTab({
-        Name = "Main",
-        Icon = "rbxassetid://4483345998",
-        PremiumOnly = false
-    })
-
-    MainTab:AddSection({Name = "対象プレイヤー選択"})
-
-    local TargetDropdown = MainTab:AddDropdown({
-        Name = "サーバーのプレイヤー",
-        Default = "",
-        Options = GetPlayerNames(),
-        Callback = function(value)
-            TargetName = value
-        end
-    })
-
-    MainTab:AddButton({
-        Name = "プレイヤーリスト更新",
-        Callback = function()
-            TargetDropdown:Refresh(GetPlayerNames(), true)
-            Notify("更新", "プレイヤーリストを更新しました", 2)
-        end
-    })
-
-    MainTab:AddTextbox({
-        Name = "ユーザー名を直接入力",
-        Default = "",
-        TextDisappear = false,
-        Callback = function(value)
-            TargetName = value
-        end
-    })
-
-    MainTab:AddSection({Name = "トイ操作"})
-
-    MainTab:AddButton({
-        Name = "体の中心に固定する",
-        Callback = function()
-            if TargetName == "" then
-                Notify("エラー", "対象プレイヤーを選択または入力してください", 3)
-                return
-            end
-            task.spawn(function()
-                AttachToyTo(TargetName)
-            end)
-        end
-    })
-
-    MainTab:AddButton({
-        Name = "固定したトイを削除",
-        Callback = function()
-            task.spawn(DestroyAttachedToy)
-        end
-    })
-
-    MainTab:AddSection({Name = "視点"})
-
-    MainTab:AddToggle({
-        Name = "一人称視点 (ON=一人称 / OFF=三人称)",
-        Default = false,
-        Callback = function(value)
-            ToggleView(value)
-        end
-    })
-
-    OrionLib:Init()
-end)
-
-if not okMain then
-    Notify("エラー", "GUI生成エラー: " .. tostring(errMain), 5)
-    return
-end
-
---// ============================================
---// タッチ対応ドラッグ処理（OrionLibウィンドウに追加）
---// ============================================
-
-task.spawn(function()
-    task.wait(1)
-
-    local orionGui = nil
-    if gethui then
-        orionGui = gethui():FindFirstChild("Orion")
+MainTab:AddButton({
+    Name = "Toyをターゲットに固定",
+    Callback = function()
+        SpawnAndFix()
     end
-    if not orionGui then
-        orionGui = game:GetService("CoreGui"):FindFirstChild("Orion")
+})
+
+MainTab:AddButton({
+    Name = "Toy固定を停止",
+    Callback = function()
+        StopFix()
     end
-    if not orionGui then
-        orionGui = LocalPlayer.PlayerGui:FindFirstChild("Orion")
+})
+
+MainTab:AddToggle({
+    Name    = "一人称視点",
+    Default = false,
+    Callback = function(value)
+        ApplyView(value)
     end
+})
 
-    if not orionGui then
-        Notify("情報", "Orionウィンドウを検出できませんでした", 3)
-        return
-    end
-
-    local mainFrame = orionGui:FindFirstChild("MainFrame") or orionGui:FindFirstChildWhichIsA("Frame", true)
-    if not mainFrame then
-        Notify("情報", "メインフレームを検出できませんでした", 3)
-        return
-    end
-
-    local dragHandle = mainFrame:FindFirstChild("TopBar") or mainFrame:FindFirstChild("TitleBar") or mainFrame
-
-    local dragging = false
-    local dragInput = nil
-    local startPos = nil
-    local startInputPos = nil
-
-    dragHandle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            startInputPos = input.Position
-            startPos = mainFrame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-
-    dragHandle.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            dragInput = input
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            local delta = input.Position - startInputPos
-            mainFrame.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-
-    Notify("情報", "タッチドラッグを有効化しました", 2)
-end)
-
-Notify("読み込み完了", "Toy Attacherを起動しました", 3)
-
+OrionLib:Init()
 
